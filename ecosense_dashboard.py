@@ -21,26 +21,23 @@ if 'sensor_data' not in st.session_state:
 if 'ultimo_crudo' not in st.session_state:
     st.session_state.ultimo_crudo = ""
 
-
+# ------------ MQTT: obtener un mensaje ----------------
 def get_mqtt_message(broker, port, topic, client_id):
-    """Obtiene UN mensaje MQTT, pero solo acepta JSON válido del ESP32."""
+    """Obtiene UN mensaje MQTT y solo acepta JSON válido del ESP32."""
     message_received = {"received": False, "payload": None}
 
     def on_message(client, userdata, message):
-        # Guardamos siempre el texto crudo por si acaso
         text = message.payload.decode(errors="ignore")
         st.session_state.ultimo_crudo = text
 
-        # Intentar parsear JSON
         try:
             payload = json.loads(text)
 
-            # Aceptamos solo si es un dict y parece venir del ESP32
             if isinstance(payload, dict) and "Temp" in payload:
                 message_received["payload"] = payload
                 message_received["received"] = True
-        except Exception:
-            # Si no es JSON válido (por ejemplo "tt"), lo ignoramos
+
+        except:
             pass
 
     try:
@@ -50,7 +47,6 @@ def get_mqtt_message(broker, port, topic, client_id):
         client.subscribe(topic)
         client.loop_start()
 
-        # Esperar máximo 10 segundos a que llegue UN JSON válido
         timeout = time.time() + 10
         while not message_received["received"] and time.time() < timeout:
             time.sleep(0.1)
@@ -58,110 +54,138 @@ def get_mqtt_message(broker, port, topic, client_id):
         client.loop_stop()
         client.disconnect()
 
-        # Si nunca llegó JSON, devolvemos None
         return message_received["payload"]
 
     except Exception as e:
         return {"error": str(e)}
 
 
+# ------------ Publicar comandos MQTT ----------------
+def send_mqtt_command(broker, port, topic, client_id, msg):
+    """Envía un mensaje MQTT SIN suscribirse a nada."""
+    try:
+        client = mqtt.Client(client_id=client_id + "_cmd")
+        client.connect(broker, port, 60)
+        client.publish(topic, msg)
+        client.disconnect()
+    except Exception as e:
+        st.error(f"Error publicando comando: {e}")
+
+
 # --------------------------------------------------
 # Sidebar - Configuración
 # --------------------------------------------------
 with st.sidebar:
-    st.subheader('⚙️ Configuración de Conexión')
+    st.subheader('⚙️ Configuración MQTT')
 
-    broker = st.text_input(
-        'Broker MQTT',
-        value='broker.mqttdashboard.com',
-        help='Dirección del broker MQTT'
-    )
+    broker = st.text_input('Broker', value='broker.mqttdashboard.com')
+    port = st.number_input('Puerto', value=1883)
 
-    port = st.number_input(
-        'Puerto',
-        value=1883,
-        min_value=1,
-        max_value=65535,
-        help='Puerto del broker (generalmente 1883)'
-    )
+    topic_data = st.text_input('Tópico datos', value='Sensor/THP2')
+    topic_vent = st.text_input('Tópico ventilador', value='Sensor/cmd/vent')
+    topic_lamp = st.text_input('Tópico lámpara', value='Sensor/cmd/lamp')
 
-    topic = st.text_input(
-        'Tópico',
-        value='Sensor/THP2',
-        help='Tópico MQTT a suscribirse (debe coincidir con el del ESP32)'
-    )
+    client_id = st.text_input('ID Cliente', value='ecosense_streamlit')
 
-    client_id = st.text_input(
-        'ID del Cliente',
-        value='ecosense_streamlit',
-        help='Identificador único para esta conexión'
-    )
 
 # --------------------------------------------------
-# Título
+# UI principal
 # --------------------------------------------------
-st.title('🌱 EcoSense – Lector de Sensor MQTT')
+st.title("🌱 EcoSense – Lector de Sensor MQTT")
 
-# --------------------------------------------------
-# Información
-# --------------------------------------------------
-with st.expander('ℹ️ Información', expanded=False):
-    st.markdown("""
-    1. En Wokwi, pon el proyecto en **Play**.
-    2. Asegúrate de que el ESP32 publique en el tópico **`Sensor/THP2`**.
-    3. Presiona **Obtener datos del sensor** para leer el último JSON.
+with st.expander("ℹ️ Información"):
+    st.write("""
+    • Presiona **Obtener datos** para recibir la última lectura enviada por el ESP32.  
+    • Los comandos de luz/ventilador se envían por MQTT.  
+    • Puedes escribir un comando como "enciende luz" o "apaga ventilador".
     """)
 
 st.divider()
 
-# --------------------------------------------------
-# Botón para obtener datos
-# --------------------------------------------------
-if st.button('🔄 Obtener datos del sensor', use_container_width=True):
-    with st.spinner('Conectando al broker y esperando datos...'):
-        sensor_data = get_mqtt_message(broker, int(port), topic, client_id)
-        st.session_state.sensor_data = sensor_data
+# ------------ Botón de lectura ----------------
+if st.button("🔄 Obtener datos del sensor", use_container_width=True):
+    with st.spinner("Conectando y esperando datos..."):
+        data = get_mqtt_message(broker, port, topic_data, client_id)
+        st.session_state.sensor_data = data
 
-# --------------------------------------------------
-# Mostrar resultados
-# --------------------------------------------------
+# ------------ Mostrar datos ----------------
 if st.session_state.sensor_data:
-    st.divider()
-    st.subheader('📊 Datos recibidos')
 
-    data = st.session_state.sensor_data
-
-    # Error de conexión
-    if isinstance(data, dict) and 'error' in data:
-        st.error(f"❌ Error de conexión: {data['error']}")
+    if isinstance(st.session_state.sensor_data, dict) and "error" in st.session_state.sensor_data:
+        st.error("❌ Error: " + st.session_state.sensor_data["error"])
     else:
-        st.success('✅ Datos recibidos correctamente')
+        data = st.session_state.sensor_data
 
-        # Si es JSON con campos del ESP32, mostramos métricas bonitas
-        if isinstance(data, dict):
-            # Métricas principales si existen
-            temp = data.get("Temp")
-            hum = data.get("Hum")
-            luz = data.get("Luz")
-            gas = data.get("Gas_ppm")
-            servo = data.get("Servo_deg")
+        st.success("Datos recibidos correctamente ✔")
 
-            cols = st.columns(5)
+        # ---- Métricas
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("🌡️ Temp (°C)", f"{data['Temp']:.1f}")
+        col2.metric("💧 Hum (%)", f"{data['Hum']:.1f}")
+        col3.metric("💡 Luz", data["Luz"])
+        col4.metric("🔥 Gas (ppm)", f"{data['Gas_ppm']:.0f}")
 
-            cols[0].metric("Temp (°C)", f"{temp:.1f}" if isinstance(temp, (int, float)) else "—")
-            cols[1].metric("Hum (%)", f"{hum:.1f}" if isinstance(hum, (int, float)) else "—")
-            cols[2].metric("Luz (raw)", f"{luz}" if luz is not None else "—")
-            cols[3].metric("Gas (ppm)", f"{gas:.1f}" if isinstance(gas, (int, float)) else "—")
-            cols[4].metric("Servo (°)", f"{servo}" if servo is not None else "—")
-
-            with st.expander('Ver JSON completo'):
-                st.json(data)
+        # ---- Estado de rejilla
+        st.subheader("🪟 Estado de rejilla de gas")
+        if data["Servo_deg"] > 90:
+            st.info("🔓 **Rejilla abierta**")
         else:
-            # Si por alguna razón no es dict, lo mostramos tal cual
-            st.code(str(data))
+            st.info("🔒 **Rejilla cerrada**")
 
-# --------------------------------------------------
-# Debug opcional
-# --------------------------------------------------
-with st.expander("🔍 Último mensaje crudo recibido"):
-    st.code(st.session_state.ultimo_crudo or "Todavía ninguno")
+        # ---- Sugerencias inteligentes ----
+        st.subheader("💡 Sugerencias")
+
+        if data["Temp"] > 30:
+            st.warning("🔥 Hace calor — Te recomendamos encender el ventilador.")
+
+        if data["Luz"] < 2000:
+            st.warning("💡 Hay poca luz — Te recomendamos encender la lámpara.")
+
+        if data["Gas_ppm"] > 2000:
+            st.error("⚠️ Niveles peligrosos de gas — ventila el ambiente.")
+
+        st.divider()
+
+        # ---------- Control táctil ----------
+        st.subheader("📍 Control manual")
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.write("💡 **Lámpara**")
+            if st.button("Encender luz"):
+                send_mqtt_command(broker, port, topic_lamp, client_id, "ON")
+            if st.button("Apagar luz"):
+                send_mqtt_command(broker, port, topic_lamp, client_id, "OFF")
+
+        with c2:
+            st.write("🌀 **Ventilador (LED rojo)**")
+            if st.button("Encender ventilador"):
+                send_mqtt_command(broker, port, topic_vent, client_id, "ON")
+            if st.button("Apagar ventilador"):
+                send_mqtt_command(broker, port, topic_vent, client_id, "OFF")
+
+        st.divider()
+
+        # ---------- Comando de voz ----------
+        st.subheader("🎙️ Control por comando de voz")
+
+        voice = st.text_input("Escribe tu comando:")
+
+        if st.button("Enviar comando"):
+            v = voice.lower()
+
+            if "enciende luz" in v:
+                send_mqtt_command(broker, port, topic_lamp, client_id, "ON")
+            elif "apaga luz" in v:
+                send_mqtt_command(broker, port, topic_lamp, client_id, "OFF")
+            elif "enciende ventilador" in v or "enciende abanico" in v:
+                send_mqtt_command(broker, port, topic_vent, client_id, "ON")
+            elif "apaga ventilador" in v or "apaga abanico" in v:
+                send_mqtt_command(broker, port, topic_vent, client_id, "OFF")
+            else:
+                st.warning("Comando no reconocido. Intenta: 'enciende luz', 'apaga ventilador', etc.")
+
+# ------------ Debug ----------------
+with st.expander("📄 Último mensaje crudo MQTT"):
+    st.code(st.session_state.ultimo_crudo or "Ninguno")
