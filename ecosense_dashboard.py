@@ -46,7 +46,14 @@ def get_mqtt_client():
     """Crea (una sola vez) el cliente MQTT y lo deja en loop_start()."""
     if st.session_state.mqtt_client is None:
         client_id = f"ecosense-dashboard-{int(time.time())}"
-        client = mqtt.Client(client_id)
+
+        # 👇 ARREGLO PARA PAHO-MQTT 2.x
+        # Indicamos versión de la API de callbacks para evitar ValueError
+        client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION1,
+            client_id=client_id
+        )
+
         client.on_connect = on_connect
         client.on_message = on_message
         client.connect(BROKER, PORT, 60)
@@ -186,8 +193,10 @@ if st.button("Enviar comando"):
             sent_any = True
 
         if not sent_any:
-            st.info("No se reconoció ningún dispositivo en el comando. "
-                    "Prueba con frases como `enciende luz` o `apaga ventilador`.")
+            st.info(
+                "No se reconoció ningún dispositivo en el comando. "
+                "Prueba con frases como `enciende luz` o `apaga ventilador`."
+            )
 
 st.markdown("---")
 st.caption("EcoSense • Lectura y control de gas, luz y temperatura en tiempo real usando MQTT.")
