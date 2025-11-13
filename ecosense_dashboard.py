@@ -1,187 +1,312 @@
 import json
 import time
-import random
+import threading
 
-import pandas as pd
 import streamlit as st
 import paho.mqtt.client as mqtt
 
-# ==========================
-# Configuración básica
-# ==========================
-MQTT_BROKER = "broker.mqttdashboard.com"
-MQTT_PORT = 1883
-TOPIC_DATOS = "ecosense/datos"   # Publicado por el ESP32
-TOPIC_CMD = "ecosense/cmd"       # Comandos desde el dashboard
+from bokeh.models.widgets import Button
+from bokeh.models import CustomJS
+from streamlit_bokeh_events import streamlit_bokeh_events
 
-st.set_page_config(
-    page_title="EcoSense · Dashboard",
-    layout="wide",
-    page_icon="🌱",
-)
+# -------------------------
+# Configuración general
+# -------------------------
+BROKER = "broker.mqttdashboard.com"
+PORT = 1883
+TOPIC_DATA = "ecosense/datos"
+TOPIC_CMD = "ecosense/cmd"
+CLIENT_ID = "EcoSenseDashboard"
 
-st.title("🌱 EcoSense · Panel en Tiempo Real")
-st.caption("Por: **Juan David Castro Valencia**")
+st.set_page_config(page_title="EcoSense · Panel en Tiempo Real", layout="wide")
 
-st.markdown(
-    """
-Este panel se conecta al mismo **broker MQTT** que el ESP32 en Wokwi.
+# -------------------------
+# Estado global (por sesión)
+# -------------------------
+state = st.session_state
 
-- El ESP32 publica lecturas cada ~2 s en el topic `ecosense/datos`.
-- Desde aquí podemos visualizar **temperatura, luz y gas**.
-- También enviamos comandos al topic `ecosense/cmd` para controlar la **alarma**.
-"""
-)
+if "mqtt_client" not in state:
+    state.mqtt_client = None
+if "last_data" not in state:
+    state.last_data = None
+if "last_raw" not in state:
+    state.last_raw = ""
+if "last_update_ts" not in state:
+    state.last_update_ts = None
+if "alarm_state" not in state:
+    state.alarm_state = "OFF"
+if "light_state" not in state:
+    state.light_state = "OFF"
+if "fan_state" not in state:
+    state.fan_state = "OFF"
+if "voice_text" not in state:
+    state.voice_text = ""
+if "mqtt_connected" not in state:
+    state.mqtt_connected = False
 
-# ==========================
-# Estado de la app
-# ==========================
-if "mqtt_client" not in st.session_state:
-    st.session_state.mqtt_client = None
 
-if "lecturas" not in st.session_state:
-    # Lista de dicts: {"t": timestamp, "temp": ..., "luz": ..., "gas": ...}
-    st.session_state.lecturas = []
-
-if "estado_alarma" not in st.session_state:
-    st.session_state.estado_alarma = "OFF"
-
-
-# ==========================
+# -------------------------
 # Callbacks MQTT
-# ==========================
+# -------------------------
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
-        print("Conectado a MQTT ✔")
-        client.subscribe(TOPIC_DATOS)
+        state.mqtt_connected = True
+        client.subscribe(TOPIC_DATA)
     else:
-        print("Error de conexión MQTT, rc =", rc)
+        state.mqtt_connected = False
+
+
+def on_disconnect(client, userdata, rc):
+    state.mqtt_connected = False
 
 
 def on_message(client, userdata, msg):
+    payload = msg.payload.decode("utf-8", errors="ignore")
+    state.last_raw = payload
+    state.last_update_ts = time.time()
+
     try:
-        payload = msg.payload.decode("utf-8")
         data = json.loads(payload)
-
-        now = time.time()
-
-        st.session_state.lecturas.append(
-            {
-                "t": now,
-                "temp": float(data.get("temp", 0)),
-                "luz": float(data.get("luz", 0)),
-                "gas": float(data.get("gas", 0)),
-            }
-        )
-
-        # Limitar a las últimas 200 lecturas para no crecer infinito
-        if len(st.session_state.lecturas) > 200:
-            st.session_state.lecturas = st.session_state.lecturas[-200:]
-
-    except Exception as e:
-        print("Error al procesar mensaje:", e)
+        norm = {k.lower(): v for k, v in data.items()}
+        state.last_data = norm
+    except Exception:
+        state.last_data = None
 
 
-# ==========================
+# -------------------------
 # Inicializar cliente MQTT
-# ==========================
-def init_mqtt_client():
-    client_id = f"ecosense-dashboard-{random.randint(0, 9999)}"
-    client = mqtt.Client(client_id=client_id, clean_session=True)
-
+# -------------------------
+def start_mqtt():
+    client = mqtt.Client(client_id=CLIENT_ID, clean_session=True)
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
 
-    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-    client.loop_start()
-    return client
+    client.connect(BROKER, PORT, keepalive=60)
+    th = threading.Thread(target=client.loop_forever, daemon=True)
+    th.start()
+
+    state.mqtt_client = client
 
 
-if st.session_state.mqtt_client is None:
-    st.session_state.mqtt_client = init_mqtt_client()
+if state.mqtt_client is None:
+    start_mqtt()
 
+client = state.mqtt_client
 
-# ==========================
-# Layout principal
-# ==========================
-col_status, col_alarma = st.columns([3, 2])
+# -------------------------
+# UI – encabezado
+# -------------------------
+st.title("🌿 EcoSense · Panel en Tiempo Real")
+st.caption("Por: Juan David Castro Valencia")
 
-with col_status:
-    st.subheader("📡 Estado de conexión")
-    st.write(f"**Broker:** `{MQTT_BROKER}`")
-    st.write(f"**Topic datos:** `{TOPIC_DATOS}`")
+with st.sidebar:
+    st.subheader("ℹ️ Sobre este panel")
+    st.write(
+        "- Se conecta al mismo **broker MQTT** que el ESP32 en Wokwi.\n"
+        "- El ESP32 publica lecturas en el topic `ecosense/datos`.\n"
+        "- Aquí puedes ver en tiempo real **temperatura**, **luz** y **gas**.\n"
+        "- Desde aquí controlas la **alarma**, la **luz** y el **ventilador**.\n"
+        "- Los comandos se envían al topic `ecosense/cmd`."
+    )
+    st.markdown("---")
+    st.write(f"**Broker:** `{BROKER}`")
+    st.write(f"**Topic datos:** `{TOPIC_DATA}`")
     st.write(f"**Topic comandos:** `{TOPIC_CMD}`")
 
-with col_alarma:
+col_status, col_alarm = st.columns([2, 1])
+
+# -------------------------
+# Estado de conexión
+# -------------------------
+with col_status:
+    st.subheader("📡 Estado de conexión")
+
+    if state.mqtt_connected:
+        st.success("Conectado al broker MQTT.")
+    else:
+        st.warning("Intentando conectar al broker MQTT...")
+
+    if state.last_update_ts is None:
+        st.info(
+            "Esperando datos desde el ESP32... Asegúrate de que el proyecto en **Wokwi** está en **Play**."
+        )
+    else:
+        elapsed = time.time() - state.last_update_ts
+        st.write(f"⏱️ Último mensaje recibido hace **{elapsed:0.1f} s**")
+
+# -------------------------
+# Control de alarma
+# -------------------------
+with col_alarm:
     st.subheader("🚨 Control de alarma")
 
-    btn_on, btn_off = st.columns(2)
-    with btn_on:
-        if st.button("Activar alarma"):
-            st.session_state.estado_alarma = "ON"
-            st.session_state.mqtt_client.publish(TOPIC_CMD, "ALARMA_ON")
-    with btn_off:
-        if st.button("Desactivar alarma"):
-            st.session_state.estado_alarma = "OFF"
-            st.session_state.mqtt_client.publish(TOPIC_CMD, "ALARMA_OFF")
+    btn_on = st.button("Activar alarma")
+    btn_off = st.button("Desactivar alarma")
 
-    st.markdown(
-        f"**Estado actual:** "
-        + (
-            "🟥 `ALARMA ON`"
-            if st.session_state.estado_alarma == "ON"
-            else "🟩 `ALARMA OFF`"
-        )
-    )
+    if client is not None and state.mqtt_connected:
+        if btn_on:
+            client.publish(TOPIC_CMD, "ALARMA_ON")
+            state.alarm_state = "ON"
+
+        if btn_off:
+            client.publish(TOPIC_CMD, "ALARMA_OFF")
+            state.alarm_state = "OFF"
+
+    estado = "🟥 ALARMA ON" if state.alarm_state == "ON" else "🟩 ALARMA OFF"
+    st.write(f"Estado actual: **{estado}**")
 
 st.markdown("---")
 
-# ==========================
-# Métricas en tiempo real
-# ==========================
-if st.session_state.lecturas:
-    df = pd.DataFrame(st.session_state.lecturas)
-    # Normalizar columna tiempo para gráfico (segundos desde el inicio)
-    t0 = df["t"].min()
-    df["tiempo_s"] = (df["t"] - t0).round(1)
+# -------------------------
+# Controles de luz y ventilador
+# -------------------------
+col_light, col_fan = st.columns(2)
 
-    ult = df.iloc[-1]
+with col_light:
+    st.subheader("💡 Control de luz")
 
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.metric("🌡️ Temperatura (°C)", f"{ult['temp']:.1f}")
-    with m2:
-        st.metric("💡 Luz (ADC)", f"{int(ult['luz'])}")
-    with m3:
-        st.metric("🧪 Gas (ADC)", f"{int(ult['gas'])}")
+    l_on = st.button("Encender luz", key="btn_light_on")
+    l_off = st.button("Apagar luz", key="btn_light_off")
 
-    st.markdown("### 📈 Evolución de las mediciones")
+    if client is not None and state.mqtt_connected:
+        if l_on:
+            client.publish(TOPIC_CMD, "LUZ_ON")
+            state.light_state = "ON"
+        if l_off:
+            client.publish(TOPIC_CMD, "LUZ_OFF")
+            state.light_state = "OFF"
 
-    g1, g2, g3 = st.columns(3)
+    txt_light = "🟡 LUZ ENCENDIDA" if state.light_state == "ON" else "⚫ LUZ APAGADA"
+    st.write(f"Estado de luz: **{txt_light}**")
 
-    with g1:
-        st.line_chart(
-            df.set_index("tiempo_s")["temp"],
-            height=250,
-        )
+with col_fan:
+    st.subheader("🌀 Control de ventilador")
 
-    with g2:
-        st.line_chart(
-            df.set_index("tiempo_s")["luz"],
-            height=250,
-        )
+    f_on = st.button("Encender ventilador", key="btn_fan_on")
+    f_off = st.button("Apagar ventilador", key="btn_fan_off")
 
-    with g3:
-        st.line_chart(
-            df.set_index("tiempo_s")["gas"],
-            height=250,
-        )
+    if client is not None and state.mqtt_connected:
+        if f_on:
+            client.publish(TOPIC_CMD, "FAN_ON")
+            state.fan_state = "ON"
+        if f_off:
+            client.publish(TOPIC_CMD, "FAN_OFF")
+            state.fan_state = "OFF"
 
-else:
+    txt_fan = "🟢 VENTILADOR ENCENDIDO" if state.fan_state == "ON" else "🔴 VENTILADOR APAGADO"
+    st.write(f"Estado de ventilador: **{txt_fan}**")
+
+st.markdown("---")
+
+# -------------------------
+# Control por voz del ventilador
+# -------------------------
+st.subheader("🎙️ Control por voz del ventilador")
+
+st.write(
+    "Pulsa **Escuchar comando**, di algo como:\n"
+    "- “Enciende el abanico” / “Enciende el ventilador”\n"
+    "- “Apaga el abanico” / “Apaga el ventilador”"
+)
+
+stt_button = Button(label="🎙️ Escuchar comando", width=250)
+stt_button.js_on_event(
+    "button_click",
+    CustomJS(
+        code="""
+    var recognition = new webkitSpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = "es-ES";
+
+    recognition.onresult = function (e) {
+        var value = "";
+        for (var i = e.resultIndex; i < e.results.length; ++i) {
+            if (e.results[i].isFinal) {
+                value += e.results[i][0].transcript;
+            }
+        }
+        if (value !== "") {
+            document.dispatchEvent(new CustomEvent("GET_TEXT", {detail: value}));
+        }
+    }
+    recognition.start();
+"""
+    ),
+)
+
+result = streamlit_bokeh_events(
+    stt_button,
+    events="GET_TEXT",
+    key="voice_listen",
+    refresh_on_update=False,
+    override_height=75,
+    debounce_time=0,
+)
+
+if result and "GET_TEXT" in result:
+    cmd_text = result["GET_TEXT"].strip().lower()
+    state.voice_text = cmd_text
+
+    st.write(f"🔊 Comando reconocido: **“{cmd_text}”**")
+
+    if client is not None and state.mqtt_connected:
+        if "enciende" in cmd_text or "prende" in cmd_text:
+            if "abanico" in cmd_text or "ventilador" in cmd_text:
+                client.publish(TOPIC_CMD, "FAN_ON")
+                state.fan_state = "ON"
+                st.success("Comando enviado: FAN_ON")
+        elif "apaga" in cmd_text or "apague" in cmd_text:
+            if "abanico" in cmd_text or "ventilador" in cmd_text:
+                client.publish(TOPIC_CMD, "FAN_OFF")
+                state.fan_state = "OFF"
+                st.success("Comando enviado: FAN_OFF")
+
+st.markdown("---")
+
+# -------------------------
+# Lecturas en tiempo real
+# -------------------------
+st.subheader("📊 Lecturas recibidas")
+
+if state.last_update_ts is None:
     st.info(
-        "Esperando datos desde el ESP32... "
-        "Asegúrate de que el proyecto en **Wokwi** está en *Play*."
+        "Todavía no se han recibido lecturas. Revisa que el ESP32 esté "
+        "publicando en el topic correcto."
     )
+else:
+    data = state.last_data or {}
+    temp = (
+        data.get("temp")
+        or data.get("temperature")
+        or data.get("temp_c")
+        or data.get("temp_celsius")
+    )
+    luz = data.get("luz") or data.get("light") or data.get("ldr")
+    gas = data.get("gas") or data.get("gas_ppm") or data.get("smoke") or data.get("gasppm")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if temp is not None:
+            st.metric("🌡️ Temperatura (°C)", f"{float(temp):0.1f}")
+        else:
+            st.write("Temperatura: (sin dato)")
+
+    with c2:
+        if luz is not None:
+            st.metric("💡 Luz (ADC)", f"{int(luz)}")
+        else:
+            st.write("Luz: (sin dato)")
+
+    with c3:
+        if gas is not None:
+            st.metric("🧪 Gas", f"{float(gas):0.1f}")
+        else:
+            st.write("Gas: (sin dato)")
+
+    st.markdown("#### Último payload recibido (crudo)")
+    st.code(state.last_raw, language="json")
 
 st.markdown("---")
 st.caption("EcoSense · Lectura de gas, luz y temperatura en tiempo real usando MQTT.")
