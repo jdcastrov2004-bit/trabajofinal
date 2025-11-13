@@ -5,42 +5,47 @@ import time
 import streamlit as st
 import paho.mqtt.client as mqtt
 
-# ---------- CONFIG MQTT (DEBE COINCIDIR CON WOKWI) ----------
+# ---------- CONFIG MQTT (MISMO BROKER Y TOPICS QUE WOKWI) ----------
 BROKER = "broker.mqttdashboard.com"
 PORT = 1883
 
-TOPIC_DATA = "Sensor/THP2"        # <-- el que usa tu ESP32 para publicar JSON
+TOPIC_DATA = "Sensor/THP2"        # <-- topic que publica el ESP32
 TOPIC_CMD_VENT = "Sensor/cmd/vent"
 TOPIC_CMD_LAMP = "Sensor/cmd/lamp"
 
-# ---------- ESTADO GLOBAL (se guarda en session_state) ----------
-for key, default in {
+# ---------- ESTADO GLOBAL (session_state) ----------
+defaults = {
     "mqtt_client": None,
     "mqtt_connected": False,
     "last_data": None,
     "last_raw_msg": "",
     "last_error": "",
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+    "last_connect_rc": None,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 
-# ---------- CALLBACKS MQTT (versión 1 de la API) ----------
+# ---------- CALLBACKS MQTT (API V1) ----------
 def on_connect(client, userdata, flags, rc):
     """Se ejecuta cuando se conecta al broker."""
-    ok = (rc == 0)
-    st.session_state.mqtt_connected = ok
-    if ok:
-        # Nos suscribimos SOLO al topic que publica el ESP32
-        client.subscribe(TOPIC_DATA)
+    st.session_state.last_connect_rc = rc
+    if rc == 0:
+        st.session_state.mqtt_connected = True
+        try:
+            client.subscribe(TOPIC_DATA)
+        except Exception as e:
+            st.session_state.last_error = f"Error al suscribirse: {e}"
     else:
+        st.session_state.mqtt_connected = False
         st.session_state.last_error = f"on_connect rc={rc}"
 
 
 def on_message(client, userdata, msg):
     """Se ejecuta cuando llega CUALQUIER mensaje."""
     try:
-        payload = msg.payload.decode("utf-8")
+        payload = msg.payload.decode("utf-8", errors="ignore")
         st.session_state.last_raw_msg = f"{msg.topic}: {payload}"
 
         if msg.topic == TOPIC_DATA:
@@ -51,13 +56,24 @@ def on_message(client, userdata, msg):
         st.session_state.last_error = f"on_message error: {e}"
 
 
+def on_disconnect(client, userdata, rc):
+    st.session_state.mqtt_connected = False
+    if rc != 0:
+        st.session_state.last_error = f"Desconectado inesperadamente rc={rc}"
+
+
+def on_log(client, userdata, level, buf):
+    # Muy útil para depurar: último log de paho
+    st.session_state.last_error = f"LOG MQTT: {buf}"
+
+
 # ---------- CREAR / RECUPERAR CLIENTE ----------
 def get_mqtt_client():
     client = st.session_state.mqtt_client
     if client is None:
         client_id = f"ecosense_dashboard_{int(time.time())}"
 
-        # IMPORTANTE: indicamos que usamos callbacks "viejos" (V1)
+        # Forzamos callbacks de API V1 (4 parámetros en on_connect)
         client = mqtt.Client(
             client_id=client_id,
             callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
@@ -65,9 +81,13 @@ def get_mqtt_client():
 
         client.on_connect = on_connect
         client.on_message = on_message
+        client.on_disconnect = on_disconnect
+        # Descomenta si quieres ver todavía más logs:
+        # client.on_log = on_log
 
         try:
-            client.connect_async(BROKER, PORT, keepalive=60)
+            # Conexión SÍNCRONA (si falla, lanza excepción)
+            client.connect(BROKER, PORT, keepalive=60)
             client.loop_start()
         except Exception as e:
             st.session_state.last_error = f"Error al conectar al broker: {e}"
@@ -96,7 +116,8 @@ st.set_page_config(
     layout="wide",
 )
 
-get_mqtt_client()  # aseguramos que el cliente se inicializa
+# Aseguramos que el cliente se inicializa al cargar la página
+get_mqtt_client()
 
 st.title("🌱 Dashboard EcoSense – Proyecto Final")
 st.caption("por: Juan David Castro Valencia")
@@ -108,14 +129,14 @@ st.write(
 )
 
 # ---------- BARRA DE ESTADO SUPERIOR ----------
-
 status_col1, status_col2 = st.columns([3, 1])
 
 with status_col1:
     if st.session_state.last_data is None:
         st.info(
             "Esperando datos desde el ESP32... "
-            "Asegúrate de que el proyecto esté en **Play** en Wokwi."
+            "Asegúrate de que el proyecto esté en **Play** en Wokwi "
+            "y que el JSON se publique en el topic `Sensor/THP2`."
         )
     else:
         st.success("Datos recibidos desde el ESP32 🎉 (MQTT activo)")
@@ -126,9 +147,9 @@ with status_col2:
     else:
         st.markdown("⚠️ **MQTT no conectado**")
 
-# ---------- MÉTRICAS PRINCIPALES ----------
-
 st.markdown("---")
+
+# ---------- MÉTRICAS PRINCIPALES ----------
 st.subheader("📊 Lecturas de sensores (último mensaje)")
 
 col1, col2, col3, col4, col5 = st.columns(5)
@@ -153,7 +174,6 @@ col5.metric("🌀 Servo (°)", f"{servo_deg}" if servo_deg is not None else "—
 st.markdown("---")
 
 # ---------- CONTROL DE DISPOSITIVOS ----------
-
 st.subheader("📍 Control de dispositivos")
 
 c1, c2 = st.columns(2)
@@ -177,7 +197,6 @@ with c2:
 st.markdown("---")
 
 # ---------- CONTROL POR TEXTO (SIMULA COMANDO DE VOZ) ----------
-
 st.subheader("🎙️ Control por texto (simulación de voz)")
 
 st.write("Ejemplos: `enciende luz`, `apaga luz`, `enciende ventilador`, `apaga ventilador`")
@@ -198,11 +217,11 @@ if st.button("Enviar comando"):
     else:
         st.warning("No reconocí el comando. Intenta con: 'enciende luz', 'apaga luz', etc.")
 
-# ---------- SECCIÓN DE DEPURACIÓN (ÚTIL PARA SABER SI LLEGA ALGO) ----------
-
-with st.expander("🔍 Depuración (debug)"):
+# ---------- SECCIÓN DE DEPURACIÓN ----------
+with st.expander("🔍 Depuración (debug MQTT)"):
     st.write("**Último mensaje crudo recibido:**")
     st.code(st.session_state.last_raw_msg or "Ninguno todavía", language="text")
 
+    st.write("**Código de retorno de la última conexión (rc):**", st.session_state.last_connect_rc)
     if st.session_state.last_error:
-        st.error(f"Último error MQTT: {st.session_state.last_error}")
+        st.error(f"Último mensaje de error / log MQTT: {st.session_state.last_error}")
