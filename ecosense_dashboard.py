@@ -5,50 +5,62 @@ import time
 import streamlit as st
 import paho.mqtt.client as mqtt
 
-# ----------------- CONFIGURACIÓN GENERAL -----------------
+# -------------- CONFIGURACIÓN MQTT -----------------
 
 BROKER = "broker.mqttdashboard.com"
 PORT = 1883
 
-TOPIC_DATA = "Sensor/THP2"       # Datos desde el ESP32
+TOPIC_DATA = "Sensor/THP2"        # Datos desde el ESP32
 TOPIC_CMD_VENT = "Sensor/cmd/vent"
 TOPIC_CMD_LAMP = "Sensor/cmd/lamp"
 
-# ----------------- ESTADO INICIAL -----------------
+# Último mensaje recibido (lo actualiza el callback)
+LATEST_DATA = None
 
-if "last_data" not in st.session_state:
-    st.session_state.last_data = None
-
-if "mqtt_client" not in st.session_state:
-    st.session_state.mqtt_client = None
+# Guardamos también el estado de conexión para mostrarlo
+MQTT_CONNECTED = False
 
 
-# ----------------- CALLBACKS MQTT -----------------
+# -------------- CALLBACKS MQTT -----------------
 
 def on_connect(client, userdata, flags, rc):
+    global MQTT_CONNECTED
     if rc == 0:
+        MQTT_CONNECTED = True
         print("Conectado al broker MQTT")
-        client.subscribe(TOPIC_DATA)
+        # Suscribimos a TODO Sensor/# para estar 100% seguros
+        client.subscribe("Sensor/#")
     else:
+        MQTT_CONNECTED = False
         print("Error de conexión. Código:", rc)
 
 
 def on_message(client, userdata, msg):
-    try:
-        payload = msg.payload.decode("utf-8")
-        data = json.loads(payload)
-        st.session_state.last_data = data
-    except Exception as e:
-        print("Error al procesar mensaje:", e)
+    """
+    Este callback se ejecuta en un hilo aparte.
+    NO usamos st.session_state aquí, solo variables globales.
+    """
+    global LATEST_DATA
+
+    topic = msg.topic
+    payload = msg.payload.decode("utf-8", errors="ignore")
+
+    # Solo procesamos el topic que nos interesa
+    if topic == TOPIC_DATA:
+        try:
+            data = json.loads(payload)
+            LATEST_DATA = data
+            print("Mensaje recibido en Sensor/THP2:", data)
+        except Exception as e:
+            print("Error al parsear JSON:", e)
 
 
 def get_mqtt_client():
     """Crea (una sola vez) el cliente MQTT y lo deja en loop_start()."""
-    if st.session_state.mqtt_client is None:
+    if "mqtt_client" not in st.session_state or st.session_state.mqtt_client is None:
         client_id = f"ecosense-dashboard-{int(time.time())}"
 
-        # 👇 ARREGLO PARA PAHO-MQTT 2.x
-        # Indicamos versión de la API de callbacks para evitar ValueError
+        # API de callbacks v1 (requisito de paho-mqtt 2.x)
         client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION1,
             client_id=client_id
@@ -56,13 +68,17 @@ def get_mqtt_client():
 
         client.on_connect = on_connect
         client.on_message = on_message
-        client.connect(BROKER, PORT, 60)
+
+        # Conexión TCP normal al puerto 1883
+        client.connect(BROKER, PORT, keepalive=60)
         client.loop_start()
+
         st.session_state.mqtt_client = client
+
     return st.session_state.mqtt_client
 
 
-# ----------------- UI PRINCIPAL -----------------
+# -------------- CONFIG STREAMLIT -----------------
 
 st.set_page_config(page_title="EcoSense – Proyecto Final", layout="wide")
 
@@ -78,21 +94,39 @@ y permite **controlar la lámpara y el ventilador** mediante botones o comandos 
 
 st.markdown("---")
 
-# Inicializar cliente MQTT
+# Inicializamos el cliente MQTT
 client = get_mqtt_client()
 
-# ----------------- SECCIÓN DE MÉTRICAS -----------------
+# ----------------- ESTADO DE CONEXIÓN -----------------
+
+status_col = st.empty()
+if MQTT_CONNECTED:
+    status_col.success("✅ Conectado al broker MQTT. Esperando datos del ESP32...")
+else:
+    status_col.info(
+        "Esperando datos desde el ESP32... "
+        "Asegúrate de que el proyecto está en **Play** en Wokwi."
+    )
+
+# Leemos el último dato global
+data = LATEST_DATA
+
+# ----------------- MÉTRICAS -----------------
 
 col_temp, col_hum, col_luz, col_gas, col_servo = st.columns(5)
 
-data = st.session_state.last_data
-
 if data is None:
-    with st.container():
-        st.info(
-            "Esperando datos desde el ESP32... "
-            "Asegúrate de que el proyecto está en **Play** en Wokwi."
-        )
+    # Si aún no hay datos, dejamos las métricas vacías
+    with col_temp:
+        st.metric("🌡️ Temperatura (°C)", "---")
+    with col_hum:
+        st.metric("💧 Humedad (%)", "---")
+    with col_luz:
+        st.metric("💡 Luz (raw)", "---")
+    with col_gas:
+        st.metric("🔥 Gas (ppm)", "---")
+    with col_servo:
+        st.metric("🪫 Servo (°)", "---")
 else:
     temp = data.get("Temp", 0.0)
     hum = data.get("Hum", 0.0)
@@ -124,7 +158,7 @@ st.markdown("---")
 
 # ----------------- CONTROL DE DISPOSITIVOS -----------------
 
-st.subheader("📍 Control de dispositivos")
+st.subheader("📍 Control de dispositivos ↩️")
 
 col_lamp_btns, col_vent_btns = st.columns(2)
 
@@ -146,7 +180,7 @@ with col_vent_btns:
         client.publish(TOPIC_CMD_VENT, "OFF")
         st.success("Comando enviado: **Desactivar ventilador** (Sensor/cmd/vent → OFF)")
 
-# Mostrar estado actual si hay datos
+# Mostrar estado actual si ya tenemos datos
 if data is not None:
     lamp_state = "ENCENDIDA" if lamp_on else "APAGADA"
     vent_state = "ENCENDIDO" if vent_on else "APAGADO"
@@ -159,7 +193,6 @@ st.markdown("---")
 # ----------------- CONTROL POR “VOZ” (TEXTO) -----------------
 
 st.subheader("🎙️ Control por voz (simulado con texto)")
-
 st.caption("Escribe comandos como: `enciende luz`, `apaga luz`, `enciende ventilador`, `apaga ventilador`…")
 
 voice_cmd = st.text_input("Comando de voz:")
@@ -169,25 +202,24 @@ if st.button("Enviar comando"):
         st.warning("Por favor escribe un comando.")
     else:
         cmd = voice_cmd.lower()
-
         sent_any = False
 
         # Luz
-        if "enciende luz" in cmd or "prende luz" in cmd or "encender luz" in cmd:
+        if any(p in cmd for p in ["enciende luz", "prende luz", "encender luz"]):
             client.publish(TOPIC_CMD_LAMP, "ON")
             st.success("🟢 Comando enviado: **Lámpara ON**")
             sent_any = True
-        elif "apaga luz" in cmd or "apagar luz" in cmd:
+        elif any(p in cmd for p in ["apaga luz", "apagar luz"]):
             client.publish(TOPIC_CMD_LAMP, "OFF")
             st.success("🔴 Comando enviado: **Lámpara OFF**")
             sent_any = True
 
         # Ventilador
-        if "enciende ventilador" in cmd or "encender ventilador" in cmd or "prende ventilador" in cmd:
+        if any(p in cmd for p in ["enciende ventilador", "encender ventilador", "prende ventilador"]):
             client.publish(TOPIC_CMD_VENT, "ON")
             st.success("🟢 Comando enviado: **Ventilador ON**")
             sent_any = True
-        elif "apaga ventilador" in cmd or "apagar ventilador" in cmd:
+        elif any(p in cmd for p in ["apaga ventilador", "apagar ventilador"]):
             client.publish(TOPIC_CMD_VENT, "OFF")
             st.success("🔴 Comando enviado: **Ventilador OFF**")
             sent_any = True
