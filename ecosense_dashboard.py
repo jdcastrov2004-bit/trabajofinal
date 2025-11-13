@@ -3,198 +3,165 @@ import paho.mqtt.client as mqtt
 import json
 import time
 
-# -------------------------------------------------------------------
+# --------------------------------------------------
 # Configuración de la página
-# -------------------------------------------------------------------
+# --------------------------------------------------
 st.set_page_config(
     page_title="EcoSense – Lector de Sensor MQTT",
     page_icon="🌱",
     layout="centered"
 )
 
-# -------------------------------------------------------------------
-# Variables de estado
-# -------------------------------------------------------------------
-if "sensor_data" not in st.session_state:
+# --------------------------------------------------
+# Estado
+# --------------------------------------------------
+if 'sensor_data' not in st.session_state:
     st.session_state.sensor_data = None
+
+if 'ultimo_crudo' not in st.session_state:
+    st.session_state.ultimo_crudo = ""
 
 
 def get_mqtt_message(broker, port, topic, client_id):
-    """
-    Se conecta al broker, se suscribe al topic y espera
-    hasta 5 segundos a que llegue un mensaje.
-    Devuelve el payload (dict si es JSON, o string si no lo es).
-    """
+    """Obtiene UN mensaje MQTT, pero solo acepta JSON válido del ESP32."""
     message_received = {"received": False, "payload": None}
 
     def on_message(client, userdata, message):
+        # Guardamos siempre el texto crudo por si acaso
+        text = message.payload.decode(errors="ignore")
+        st.session_state.ultimo_crudo = text
+
+        # Intentar parsear JSON
         try:
-            payload = json.loads(message.payload.decode())
-            message_received["payload"] = payload
-            message_received["received"] = True
+            payload = json.loads(text)
+
+            # Aceptamos solo si es un dict y parece venir del ESP32
+            if isinstance(payload, dict) and "Temp" in payload:
+                message_received["payload"] = payload
+                message_received["received"] = True
         except Exception:
-            # Si no es JSON válido, guardar como texto plano
-            message_received["payload"] = message.payload.decode()
-            message_received["received"] = True
+            # Si no es JSON válido (por ejemplo "tt"), lo ignoramos
+            pass
 
     try:
-        # Cliente MQTT
         client = mqtt.Client(client_id=client_id)
         client.on_message = on_message
-
-        # Conectar y suscribirse
         client.connect(broker, port, 60)
         client.subscribe(topic)
-
-        # Iniciar loop y esperar mensajes
         client.loop_start()
-        timeout = time.time() + 5  # máximo 5 s
+
+        # Esperar máximo 10 segundos a que llegue UN JSON válido
+        timeout = time.time() + 10
         while not message_received["received"] and time.time() < timeout:
             time.sleep(0.1)
 
-        # Cerrar conexión
         client.loop_stop()
         client.disconnect()
 
+        # Si nunca llegó JSON, devolvemos None
         return message_received["payload"]
 
     except Exception as e:
-        # En caso de error, devolvemos un dict con la clave "error"
         return {"error": str(e)}
 
 
-# -------------------------------------------------------------------
-# Sidebar - Configuración (ya apuntando a tu Wokwi)
-# -------------------------------------------------------------------
+# --------------------------------------------------
+# Sidebar - Configuración
+# --------------------------------------------------
 with st.sidebar:
-    st.subheader("⚙️ Configuración de Conexión")
+    st.subheader('⚙️ Configuración de Conexión')
 
     broker = st.text_input(
-        "Broker MQTT",
-        value="broker.mqttdashboard.com",
-        help="Dirección del broker MQTT"
+        'Broker MQTT',
+        value='broker.mqttdashboard.com',
+        help='Dirección del broker MQTT'
     )
 
     port = st.number_input(
-        "Puerto",
+        'Puerto',
         value=1883,
         min_value=1,
         max_value=65535,
-        help="Puerto del broker (generalmente 1883)"
+        help='Puerto del broker (generalmente 1883)'
     )
 
     topic = st.text_input(
-        "Tópico",
-        value="Sensor/THP2",   # <-- tópico que usa tu ESP32
-        help="Tópico MQTT al que deseas suscribirte"
+        'Tópico',
+        value='Sensor/THP2',
+        help='Tópico MQTT a suscribirse (debe coincidir con el del ESP32)'
     )
 
     client_id = st.text_input(
-        "ID del Cliente",
-        value="ecosense_streamlit",
-        help="Identificador único para este cliente"
+        'ID del Cliente',
+        value='ecosense_streamlit',
+        help='Identificador único para esta conexión'
     )
 
-# -------------------------------------------------------------------
-# Título y explicación
-# -------------------------------------------------------------------
-st.title("🌱 EcoSense – Lector de Sensor MQTT")
+# --------------------------------------------------
+# Título
+# --------------------------------------------------
+st.title('🌱 EcoSense – Lector de Sensor MQTT')
 
-with st.expander("ℹ️ Información", expanded=False):
-    st.markdown(
-        """
-        Esta app se conecta al mismo **broker MQTT** que el ESP32 en Wokwi
-        y obtiene **un solo mensaje** cada vez que presionas el botón.
-
-        Para este proyecto EcoSense:
-
-        - Broker: `broker.mqttdashboard.com`
-        - Puerto: `1883`
-        - Tópico de datos: `Sensor/THP2`
-        - El ESP32 envía un JSON con campos como:
-          `Temp, Hum, Luz, Gas_ppm, Servo_deg, LED_temp, Vent_on, Lamp_on`.
-
-        1. Verifica que el proyecto de Wokwi esté en **Play**.
-        2. Pulsa **"Obtener datos del sensor"** para leer el último mensaje.
-        """
-    )
+# --------------------------------------------------
+# Información
+# --------------------------------------------------
+with st.expander('ℹ️ Información', expanded=False):
+    st.markdown("""
+    1. En Wokwi, pon el proyecto en **Play**.
+    2. Asegúrate de que el ESP32 publique en el tópico **`Sensor/THP2`**.
+    3. Presiona **Obtener datos del sensor** para leer el último JSON.
+    """)
 
 st.divider()
 
-# -------------------------------------------------------------------
+# --------------------------------------------------
 # Botón para obtener datos
-# -------------------------------------------------------------------
-if st.button("🔄 Obtener datos del sensor", use_container_width=True):
-    with st.spinner("Conectando al broker y esperando datos..."):
+# --------------------------------------------------
+if st.button('🔄 Obtener datos del sensor', use_container_width=True):
+    with st.spinner('Conectando al broker y esperando datos...'):
         sensor_data = get_mqtt_message(broker, int(port), topic, client_id)
         st.session_state.sensor_data = sensor_data
 
-# -------------------------------------------------------------------
+# --------------------------------------------------
 # Mostrar resultados
-# -------------------------------------------------------------------
+# --------------------------------------------------
 if st.session_state.sensor_data:
     st.divider()
-    st.subheader("📊 Datos recibidos")
+    st.subheader('📊 Datos recibidos')
 
     data = st.session_state.sensor_data
 
-    # ¿Hubo error de conexión?
-    if isinstance(data, dict) and "error" in data:
-        st.error(f"❌ Error de conexión MQTT: {data['error']}")
+    # Error de conexión
+    if isinstance(data, dict) and 'error' in data:
+        st.error(f"❌ Error de conexión: {data['error']}")
     else:
-        st.success("✅ Datos recibidos correctamente")
+        st.success('✅ Datos recibidos correctamente')
 
-        # Intentamos interpretar el JSON del ESP32 EcoSense
+        # Si es JSON con campos del ESP32, mostramos métricas bonitas
         if isinstance(data, dict):
-            # Tomamos los campos más importantes si existen
+            # Métricas principales si existen
             temp = data.get("Temp")
             hum = data.get("Hum")
             luz = data.get("Luz")
-            gas_ppm = data.get("Gas_ppm")
-            servo_deg = data.get("Servo_deg")
-            led_temp = data.get("LED_temp")
-            vent_on = data.get("Vent_on")
-            lamp_on = data.get("Lamp_on")
+            gas = data.get("Gas_ppm")
+            servo = data.get("Servo_deg")
 
-            # Métricas principales
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.metric(
-                    "🌡️ Temperatura (°C)",
-                    f"{temp:.1f}" if isinstance(temp, (int, float)) else "—"
-                )
-                st.metric(
-                    "💧 Humedad (%)",
-                    f"{hum:.1f}" if isinstance(hum, (int, float)) else "—"
-                )
-            with c2:
-                st.metric("💡 Luz (raw)", str(luz) if luz is not None else "—")
-                st.metric(
-                    "🔥 Gas (ppm)",
-                    f"{gas_ppm:.1f}" if isinstance(gas_ppm, (int, float)) else "—"
-                )
-            with c3:
-                st.metric("🌀 Servo (°)", str(servo_deg) if servo_deg is not None else "—")
-                st.metric(
-                    "🔥 LED temperatura",
-                    "ON" if led_temp else "OFF" if led_temp is not None else "—"
-                )
+            cols = st.columns(5)
 
-            st.markdown("---")
+            cols[0].metric("Temp (°C)", f"{temp:.1f}" if isinstance(temp, (int, float)) else "—")
+            cols[1].metric("Hum (%)", f"{hum:.1f}" if isinstance(hum, (int, float)) else "—")
+            cols[2].metric("Luz (raw)", f"{luz}" if luz is not None else "—")
+            cols[3].metric("Gas (ppm)", f"{gas:.1f}" if isinstance(gas, (int, float)) else "—")
+            cols[4].metric("Servo (°)", f"{servo}" if servo is not None else "—")
 
-            # Estado de actuadores (si el ESP32 los envía)
-            st.subheader("🔌 Estado de actuadores (según el JSON)")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.write("**Lámpara:**", "🔆 Encendida" if lamp_on else "🌑 Apagada")
-            with col_b:
-                st.write("**Ventilador:**", "🟢 ON" if vent_on else "⚫ OFF")
-
-            # JSON completo para evidencias
-            st.markdown("---")
-            with st.expander("Ver JSON completo recibido"):
+            with st.expander('Ver JSON completo'):
                 st.json(data)
-
         else:
-            # Si no es un dict, lo mostramos tal cual
-            st.code(str(data), language="text")
+            # Si por alguna razón no es dict, lo mostramos tal cual
+            st.code(str(data))
+
+# --------------------------------------------------
+# Debug opcional
+# --------------------------------------------------
+with st.expander("🔍 Último mensaje crudo recibido"):
+    st.code(st.session_state.ultimo_crudo or "Todavía ninguno")
