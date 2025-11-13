@@ -1,203 +1,187 @@
-# ecosense_dashboard.py
 import json
-import random
 import time
-from datetime import datetime
+import random
 
+import pandas as pd
 import streamlit as st
+import paho.mqtt.client as mqtt
 
-# =========================
-#  MQTT opcional
-# =========================
-try:
-    import paho.mqtt.client as mqtt
-    HAS_MQTT = True
-except ModuleNotFoundError:
-    HAS_MQTT = False
+# ==========================
+# Configuración básica
+# ==========================
+MQTT_BROKER = "broker.mqttdashboard.com"
+MQTT_PORT = 1883
+TOPIC_DATOS = "ecosense/datos"   # Publicado por el ESP32
+TOPIC_CMD = "ecosense/cmd"       # Comandos desde el dashboard
 
-
-# =========================
-#  Configuración básica
-# =========================
 st.set_page_config(
-    page_title="EcoSense · Panel Ambiental",
-    page_icon="🌿",
+    page_title="EcoSense · Dashboard",
     layout="wide",
+    page_icon="🌱",
 )
 
-st.title("🌿 EcoSense · Monitoreo Ambiental")
-st.caption("Proyecto final · Interfaces multimodales · por: Juan David Castro Valencia")
+st.title("🌱 EcoSense · Panel en Tiempo Real")
+st.caption("Por: **Juan David Castro Valencia**")
 
-with st.sidebar:
-    st.subheader("Acerca del proyecto")
-    st.write(
-        "Este panel muestra los valores de **gas**, **luz** y **temperatura** "
-        "obtenidos desde un ESP32 con tres sensores conectados en Wokwi."
-    )
-    st.write(
-        "Si no hay conexión MQTT, el sistema genera datos simulados para poder "
-        "probar la interfaz sin hardware."
-    )
+st.markdown(
+    """
+Este panel se conecta al mismo **broker MQTT** que el ESP32 en Wokwi.
 
+- El ESP32 publica lecturas cada ~2 s en el topic `ecosense/datos`.
+- Desde aquí podemos visualizar **temperatura, luz y gas**.
+- También enviamos comandos al topic `ecosense/cmd` para controlar la **alarma**.
+"""
+)
 
-# =========================
-#  Estado inicial
-# =========================
-if "ultima_lectura" not in st.session_state:
-    st.session_state.ultima_lectura = {
-        "gas": 0,
-        "luz": 0,
-        "temp": 0.0,
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "origen": "simulado",
-    }
+# ==========================
+# Estado de la app
+# ==========================
+if "mqtt_client" not in st.session_state:
+    st.session_state.mqtt_client = None
 
+if "lecturas" not in st.session_state:
+    # Lista de dicts: {"t": timestamp, "temp": ..., "luz": ..., "gas": ...}
+    st.session_state.lecturas = []
 
-# =========================
-#  MQTT (opcional / avanzado)
-# =========================
-def configurar_mqtt():
-    broker = st.sidebar.text_input(
-        "Broker MQTT",
-        value="broker.mqttdashboard.com",
-        help="Solo si usas conexión MQTT real.",
-    )
-    topic = st.sidebar.text_input(
-        "Topic de lectura",
-        value="ecosense/datos",
-        help="Debe coincidir con el topic que publique el ESP32.",
-    )
-
-    usar_mqtt = HAS_MQTT and st.sidebar.toggle(
-        "Activar MQTT (modo avanzado)", value=False,
-        help="Requiere que el paquete 'paho-mqtt' esté instalado en el servidor."
-    )
-
-    if not HAS_MQTT and usar_mqtt:
-        st.sidebar.warning("En este servidor no está instalado 'paho-mqtt'. "
-                           "La app seguirá usando datos simulados.")
-        usar_mqtt = False
-
-    return usar_mqtt, broker, topic
+if "estado_alarma" not in st.session_state:
+    st.session_state.estado_alarma = "OFF"
 
 
-def iniciar_cliente_mqtt(broker, topic):
-    """Configura el cliente MQTT en modo no bloqueante."""
-    client = mqtt.Client("EcoSenseDashboard")
+# ==========================
+# Callbacks MQTT
+# ==========================
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("Conectado a MQTT ✔")
+        client.subscribe(TOPIC_DATOS)
+    else:
+        print("Error de conexión MQTT, rc =", rc)
 
-    def on_connect(cl, userdata, flags, rc):
-        if rc == 0:
-            cl.subscribe(topic)
-        else:
-            st.toast(f"Error al conectar MQTT (código {rc})", icon="⚠️")
 
-    def on_message(cl, userdata, msg):
-        try:
-            payload = msg.payload.decode("utf-8")
-            data = json.loads(payload)
-            # Se espera algo como {"gas": 123, "luz": 456, "temp": 24.5}
-            st.session_state.ultima_lectura = {
-                "gas": float(data.get("gas", 0)),
+def on_message(client, userdata, msg):
+    try:
+        payload = msg.payload.decode("utf-8")
+        data = json.loads(payload)
+
+        now = time.time()
+
+        st.session_state.lecturas.append(
+            {
+                "t": now,
+                "temp": float(data.get("temp", 0)),
                 "luz": float(data.get("luz", 0)),
-                "temp": float(data.get("temp", 0.0)),
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "origen": "MQTT",
-                "raw": payload,
+                "gas": float(data.get("gas", 0)),
             }
-        except Exception as e:
-            st.session_state.ultima_lectura["raw"] = f"Error al parsear: {e}"
+        )
+
+        # Limitar a las últimas 200 lecturas para no crecer infinito
+        if len(st.session_state.lecturas) > 200:
+            st.session_state.lecturas = st.session_state.lecturas[-200:]
+
+    except Exception as e:
+        print("Error al procesar mensaje:", e)
+
+
+# ==========================
+# Inicializar cliente MQTT
+# ==========================
+def init_mqtt_client():
+    client_id = f"ecosense-dashboard-{random.randint(0, 9999)}"
+    client = mqtt.Client(client_id=client_id, clean_session=True)
 
     client.on_connect = on_connect
     client.on_message = on_message
 
-    try:
-        client.connect(broker, 1883, 60)
-        client.loop_start()
-        return client
-    except Exception as e:
-        st.sidebar.error(f"No se pudo conectar al broker MQTT: {e}")
-        return None
+    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+    client.loop_start()
+    return client
 
 
-usar_mqtt, broker, topic = configurar_mqtt()
-mqtt_client = None
-if usar_mqtt:
-    mqtt_client = iniciar_cliente_mqtt(broker, topic)
+if st.session_state.mqtt_client is None:
+    st.session_state.mqtt_client = init_mqtt_client()
 
 
-# =========================
-#  Datos simulados
-# =========================
-def generar_datos_simulados():
-    """Genera una lectura de ejemplo cuando no hay MQTT."""
-    gas = random.randint(150, 850)          # ADC gas
-    luz = random.randint(0, 4095)           # ADC fotoresistor
-    temp = round(random.uniform(20, 32), 1) # °C
-    st.session_state.ultima_lectura = {
-        "gas": gas,
-        "luz": luz,
-        "temp": temp,
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "origen": "simulado",
-    }
+# ==========================
+# Layout principal
+# ==========================
+col_status, col_alarma = st.columns([3, 2])
 
+with col_status:
+    st.subheader("📡 Estado de conexión")
+    st.write(f"**Broker:** `{MQTT_BROKER}`")
+    st.write(f"**Topic datos:** `{TOPIC_DATOS}`")
+    st.write(f"**Topic comandos:** `{TOPIC_CMD}`")
 
-# Si no usamos MQTT, cada recarga genera valores nuevos
-if not usar_mqtt:
-    generar_datos_simulados()
+with col_alarma:
+    st.subheader("🚨 Control de alarma")
 
+    btn_on, btn_off = st.columns(2)
+    with btn_on:
+        if st.button("Activar alarma"):
+            st.session_state.estado_alarma = "ON"
+            st.session_state.mqtt_client.publish(TOPIC_CMD, "ALARMA_ON")
+    with btn_off:
+        if st.button("Desactivar alarma"):
+            st.session_state.estado_alarma = "OFF"
+            st.session_state.mqtt_client.publish(TOPIC_CMD, "ALARMA_OFF")
 
-# =========================
-#  Layout principal
-# =========================
-lectura = st.session_state.ultima_lectura
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.metric("🌡️ Temperatura (°C)", f"{lectura['temp']:.1f}")
-with col2:
-    st.metric("💡 Luz (ADC)", int(lectura["luz"]))
-with col3:
-    st.metric("🌫️ Gas (ADC)", int(lectura["gas"]))
-
-st.caption(
-    f"Última actualización: **{lectura['timestamp']}** · "
-    f"Origen de datos: **{lectura['origen']}**"
-)
+    st.markdown(
+        f"**Estado actual:** "
+        + (
+            "🟥 `ALARMA ON`"
+            if st.session_state.estado_alarma == "ON"
+            else "🟩 `ALARMA OFF`"
+        )
+    )
 
 st.markdown("---")
 
-# =========================
-#  Gráfica simple (historial en sesión)
-# =========================
-if "historial" not in st.session_state:
-    st.session_state.historial = []
+# ==========================
+# Métricas en tiempo real
+# ==========================
+if st.session_state.lecturas:
+    df = pd.DataFrame(st.session_state.lecturas)
+    # Normalizar columna tiempo para gráfico (segundos desde el inicio)
+    t0 = df["t"].min()
+    df["tiempo_s"] = (df["t"] - t0).round(1)
 
-st.session_state.historial.append(
-    {
-        "t": datetime.now().strftime("%H:%M:%S"),
-        "temp": lectura["temp"],
-        "luz": lectura["luz"],
-        "gas": lectura["gas"],
-    }
-)
+    ult = df.iloc[-1]
 
-with st.expander("📈 Ver historial de esta sesión"):
-    import pandas as pd
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("🌡️ Temperatura (°C)", f"{ult['temp']:.1f}")
+    with m2:
+        st.metric("💡 Luz (ADC)", f"{int(ult['luz'])}")
+    with m3:
+        st.metric("🧪 Gas (ADC)", f"{int(ult['gas'])}")
 
-    df = pd.DataFrame(st.session_state.historial)
-    st.line_chart(df.set_index("t"))
+    st.markdown("### 📈 Evolución de las mediciones")
 
-# =========================
-#  Debug / información
-# =========================
-with st.expander("🛠️ Información técnica / debug"):
-    st.write("HAS_MQTT:", HAS_MQTT)
-    st.write("Broker configurado:", broker)
-    st.write("Topic:", topic)
-    st.write("Última lectura completa:", st.session_state.ultima_lectura)
+    g1, g2, g3 = st.columns(3)
 
-st.info(
-    "Este panel puede usarse solo con datos simulados o conectarse a un broker MQTT "
-    "si el entorno tiene instalado `paho-mqtt` y el ESP32 está publicando en el topic configurado."
-)
+    with g1:
+        st.line_chart(
+            df.set_index("tiempo_s")["temp"],
+            height=250,
+        )
+
+    with g2:
+        st.line_chart(
+            df.set_index("tiempo_s")["luz"],
+            height=250,
+        )
+
+    with g3:
+        st.line_chart(
+            df.set_index("tiempo_s")["gas"],
+            height=250,
+        )
+
+else:
+    st.info(
+        "Esperando datos desde el ESP32... "
+        "Asegúrate de que el proyecto en **Wokwi** está en *Play*."
+    )
+
+st.markdown("---")
+st.caption("EcoSense · Lectura de gas, luz y temperatura en tiempo real usando MQTT.")
